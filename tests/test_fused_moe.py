@@ -186,3 +186,87 @@ def test_quant_full_and_mixed_dispatch():
     with flag_gems.use_gems(include=["abs"]):
         assert moe._int8_quant_dispatch_policy() is None
     assert moe._int8_quant_dispatch_policy() is False
+
+
+@pytest.mark.parametrize("column", [0, 384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_oai_nan_survives_clamp(column, dtype, monkeypatch):
+    """A NaN gate or up value must not be replaced by the clamp bound."""
+    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+    packed = torch.ones((2, 768), device="cuda", dtype=dtype)
+    packed[0, column] = float("nan")
+    activated = torch.empty((2, 384), device="cuda", dtype=dtype)
+    moe._swigluoai_quantize_per_token_triton(packed, activated, 1.702, 1.0, 7.0)
+    torch.testing.assert_close(
+        activated, literal_oai(packed), rtol=0, atol=0, equal_nan=True
+    )
+    assert torch.isnan(activated[0, 0])
+    assert not torch.isnan(activated[1]).any()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_uninterleave_nan_survives_clamp(dtype):
+    packed = torch.ones((2, 768), device="cuda", dtype=dtype)
+    packed[0, 0] = float("nan")
+    packed[1, 384] = float("nan")
+    out = torch.empty((2, 384), device="cuda", dtype=dtype)
+    moe.apply_moe_activation(
+        moe.MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        out,
+        packed,
+        gemm1_alpha=1.702,
+        gemm1_beta=1.0,
+        gemm1_clamp_limit=7.0,
+    )
+    torch.testing.assert_close(out, literal_oai(packed), rtol=0, atol=0, equal_nan=True)
+    assert torch.isnan(out[0, 0]) and torch.isnan(out[1, 0])
+
+
+def test_quant_offsets_promote_past_int32():
+    """A large base tensor makes a small view's row offset exceed int32."""
+    rows, k = 3, 384
+    stride = 2**30  # row offsets reach 2 * 2**30 > 2**31 - 1
+    # Reaching the int32 boundary at 2 bytes per element needs ~4 GiB; there
+    # is no smaller buffer that can produce the overflow.
+    needed = (stride * (rows - 1) + k) * 2
+    free, _ = torch.cuda.mem_get_info()
+    if free < needed + (1 << 30):
+        pytest.skip(f"needs ~{needed >> 30} GiB free, has {free >> 30} GiB")
+    base = torch.zeros(stride * (rows - 1) + k, device="cuda", dtype=torch.bfloat16)
+    view = base.as_strided((rows, k), (stride, 1))
+    view.copy_(torch.randn((rows, k), device="cuda", dtype=torch.bfloat16) * 8)
+    q, s = moe._int8_quantize_per_token_triton(view)
+    rq, rs = literal_quant(view)
+    assert torch.equal(q, rq)
+    torch.testing.assert_close(s, rs, rtol=0, atol=0)
+
+
+def test_oai_scalars_do_not_specialize_the_kernel():
+    """Scalars are runtime args, so distinct values must not recompile."""
+    kernel = moe._swigluoai_quantize_per_token_kernel
+    packed = torch.randn((4, 768), device="cuda", dtype=torch.bfloat16)
+    activated = torch.empty((4, 384), device="cuda", dtype=torch.bfloat16)
+    moe._swigluoai_quantize_per_token_triton(packed, activated, 1.702, 1.0, 7.0)
+    device = torch.cuda.current_device()
+    compiled = len(kernel.device_caches[device][0])
+    for alpha in (1.5, 1.6, 1.8, 1.9):
+        moe._swigluoai_quantize_per_token_triton(packed, activated, alpha, 1.0, 7.0)
+    assert len(kernel.device_caches[device][0]) == compiled
+
+
+def test_oai_quant_rejects_mismatched_device_metadata():
+    packed = torch.randn((2, 768), device="cuda", dtype=torch.bfloat16)
+    activated = torch.empty((2, 384), device="cpu", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError):
+        moe._swigluoai_quantize_per_token_triton(packed, activated, 1.702, 1.0, 7.0)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("value", [-1e39, 1e39])
+def test_oai_fp32_overflow_rejected_before_tensor_access(index, value):
+    params = [1.702, 1.0, 7.0]
+    params[index] = value
+    # Scalars are checked before any tensor metadata is read, so passing None
+    # tensors still produces the scalar error rather than an AttributeError.
+    with pytest.raises(ValueError, match="finite FP32"):
+        moe._swigluoai_quantize_per_token_triton(None, None, *params)
