@@ -24,6 +24,21 @@ _FALLBACK:
 #   "<E>,<N>,<dtype>,<block_n>,<block_k>":
 #     "<key>": [<BLOCK_SIZE_M>,<BLOCK_SIZE_N>,<BLOCK_SIZE_K>,<GROUP_SIZE_M>,<num_warps>,<num_stages>]
 #
+# A seventh element may carry extra kernel flags as a mapping, e.g.
+# [16,64,128,1,4,3,{SWAP_AB: true}].  Recognised flags are SWAP_AB and
+# INT32_DOWN; both default to false when absent.
+#
+# An entry may instead be a mapping that gives one such list per GEMM stage,
+# which lets the two GEMMs of a single MoE layer use different tiles:
+#
+#   "<key>":
+#     gemm1: [<BLOCK_SIZE_M>,...,<num_stages>, {<flags>}]
+#     gemm2: [<BLOCK_SIZE_M>,...,<num_stages>, {<flags>}]
+#
+# Both stages must agree on BLOCK_SIZE_M: expert alignment runs once per layer
+# with the GEMM1 block size and the resulting sorted_token_ids is reused by
+# GEMM2.  The loader rejects a per-stage entry that disagrees.
+#
 NVIDIA_A100-SXM4-40GB:
   "8,1792,None,0,0":
     "1": [16,256,64,1,8,4]
@@ -2856,19 +2871,40 @@ NVIDIA_H100_80GB_HBM3:
 
   # MiniMax-M3 routed experts, one TP8 rank (w1 [128,768,6144],
   # w2 [128,6144,384]), int8 w8a8 per-channel with bf16 activations.
+  #
+  # The 16..64 and 1024..8192 rows below carry per-stage tiles measured on
+  # H100 80GB HBM3.  Sparse decode is dominated by expert-weight reads, so
+  # GEMM1 alone transposes its MMA layout (SWAP_AB) while keeping K=128;
+  # GEMM2 keeps the plain layout.  In the prefill rows GEMM2 requests exact
+  # INT32 accumulation, which K=384 admits because the worst-case integer
+  # absolute sum stays below 2**24 and so converts to FP32 exactly.
   "128,384,int8_w8a8,0,0":
     "1": [16,128,64,1,4,5]
     "8": [16,64,128,8,4,4]
-    "16": [32,64,128,8,8,3]
-    "32": [16,64,64,1,4,4]
-    "64": [16,64,64,16,8,5]
+    "16":
+      gemm1: [16,64,128,1,4,3,{SWAP_AB: true}]
+      gemm2: [16,64,128,1,4,3]
+    "32":
+      gemm1: [16,64,128,1,4,3,{SWAP_AB: true}]
+      gemm2: [16,64,128,1,4,3]
+    "64":
+      gemm1: [16,64,128,1,4,3,{SWAP_AB: true}]
+      gemm2: [16,64,128,1,4,3]
     "128": [32,64,256,16,8,5]
     "256": [32,128,64,8,8,3]
     "512": [128,128,128,1,8,5]
-    "1024": [64,128,128,8,8,3]
-    "2048": [64,128,128,8,4,4]
-    "4096": [64,128,128,8,4,4]
-    "8192": [64,128,128,16,4,4]
+    "1024":
+      gemm1: [64,64,64,4,4,3]
+      gemm2: [64,128,64,2,4,3,{INT32_DOWN: true}]
+    "2048":
+      gemm1: [64,64,64,4,4,3]
+      gemm2: [64,128,64,2,4,3,{INT32_DOWN: true}]
+    "4096":
+      gemm1: [64,128,64,4,4,4]
+      gemm2: [64,128,64,4,4,4,{INT32_DOWN: true}]
+    "8192":
+      gemm1: [64,128,64,4,4,4]
+      gemm2: [64,128,64,4,4,4,{INT32_DOWN: true}]
 
   "128,352,fp8_w8a8,0,0":
     "2": [16,64,128,64,4,5]
