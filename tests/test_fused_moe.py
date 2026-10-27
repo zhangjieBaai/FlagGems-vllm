@@ -26,8 +26,7 @@ def literal_quant(x):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 384), (1, 127), (7, 384), (32, 768), (64, 6144)])
-def test_quant_and_oai_quant(dtype, shape, monkeypatch):
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+def test_quant_and_oai_quant(dtype, shape):
     torch.manual_seed(43)
     x = torch.randn(shape, device="cuda", dtype=dtype) * 8
     q, s = moe._int8_quantize_per_token_triton(x)
@@ -53,8 +52,7 @@ def test_quant_and_oai_quant(dtype, shape, monkeypatch):
     torch.testing.assert_close(s, refs, rtol=0, atol=0)
 
 
-def test_quant_nan_halfway_graph(monkeypatch):
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
+def test_quant_nan_halfway_graph():
     x = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0], [127.0, 0.5, 1.5, 2.5], [float("nan"), 1.0, -2.0, 3.0]],
         device="cuda",
@@ -95,7 +93,6 @@ def test_oai_parameter_validation():
 @pytest.mark.parametrize("mode", ["off", "quant_oai"])
 def test_w8a8_oai_experts(dtype, m, i, mode, monkeypatch):
     monkeypatch.setattr(moe, "_W8A8_QUANT_FUSION_MODE", mode)
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
     torch.manual_seed(47)
     e, h, k = 4, 128, 2
     x = torch.randn((m, h), device="cuda", dtype=dtype)
@@ -169,30 +166,82 @@ def test_w8a8_oai_experts(dtype, m, i, mode, monkeypatch):
     )
 
 
-def test_quant_full_and_mixed_dispatch():
+def test_quant_is_independent_of_flaggems_registration():
+    """The kernel owns the arithmetic, so operator overrides cannot change it.
+
+    The previous eager chain dispatched through abs/amax/clamp/div/round, which
+    meant a full, partial, or absent FlagGems registration each produced
+    different results.  Nothing here may depend on that registration.
+    """
     import flag_gems
 
+    # 52 and the half-way values below are the cases that used to diverge
+    # between the FlagGems and plain-Torch division paths.
     x = torch.tensor(
-        [[52.0, 26.0, 13.0, 0.0], [float("nan"), 1.0, 2.0, 3.0]],
+        [
+            [52.0, 26.0, 13.0, 0.0],
+            [127.0, 0.5, 1.5, 2.5],
+            [float("nan"), 1.0, 2.0, 3.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
         device="cuda",
         dtype=torch.bfloat16,
     )
-    with flag_gems.use_gems(include=["abs", "amax", "clamp", "true_divide", "round"]):
-        assert moe._int8_quant_dispatch_policy() is True
-        q, s = moe._int8_quantize_per_token_triton(x)
-        rq, rs = literal_quant(x)
+    baseline = moe._int8_quantize_per_token_triton(x)
+    registrations = (
+        ["abs", "amax", "clamp", "true_divide", "round"],  # full chain
+        ["abs"],  # partial: used to be rejected outright
+        [],  # empty include registers every operator
+    )
+    for include in registrations:
+        with flag_gems.use_gems(include=include):
+            q, s = moe._int8_quantize_per_token_triton(x)
+        assert torch.equal(q, baseline[0]), include
+        torch.testing.assert_close(s, baseline[1], rtol=0, atol=0, equal_nan=True)
+
+    # The row with a NaN is what used to swing: FlagGems' amax drops NaN and
+    # produced a finite scale, while PyTorch's propagates it.  The kernel
+    # reduces NaN itself, so the poison stays visible in the scale.
+    assert torch.isnan(baseline[1][2]).item()
+    with flag_gems.use_gems(include=["amax"]):
+        assert not torch.isnan(x[2].abs().amax(-1)).item()
+
+
+@pytest.mark.parametrize("k", [8192, 8193, 16384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_quant_wide_rows(k, dtype):
+    """Rows wider than one block take the two-pass kernel."""
+    torch.manual_seed(13)
+    x = torch.randn((3, k), device="cuda", dtype=dtype) * 8
+    q, s = moe._int8_quantize_per_token_triton(x)
+    rq, rs = literal_quant(x)
     assert torch.equal(q, rq)
-    torch.testing.assert_close(s, rs, rtol=0, atol=0, equal_nan=True)
-    with flag_gems.use_gems(include=["abs"]):
-        assert moe._int8_quant_dispatch_policy() is None
-    assert moe._int8_quant_dispatch_policy() is False
+    torch.testing.assert_close(s, rs, rtol=0, atol=0)
+
+
+def test_quant_single_and_two_pass_kernels_agree(monkeypatch):
+    torch.manual_seed(17)
+    x = torch.randn((4, 4096), device="cuda", dtype=torch.bfloat16) * 8
+    single = moe._int8_quantize_per_token_triton(x)
+    # Force the same data through the wide kernel.
+    monkeypatch.setattr(moe, "_INT8_QUANT_MAX_SINGLE_PASS_K", 1024)
+    wide = moe._int8_quantize_per_token_triton(x)
+    assert torch.equal(single[0], wide[0])
+    torch.testing.assert_close(single[1], wide[1], rtol=0, atol=0)
+
+
+def test_quant_wide_row_keeps_nan_scale():
+    x = torch.randn((2, 16384), device="cuda", dtype=torch.bfloat16)
+    x[0, 9999] = float("nan")
+    _, s = moe._int8_quantize_per_token_triton(x)
+    assert torch.isnan(s[0]).item()
+    assert not torch.isnan(s[1]).item()
 
 
 @pytest.mark.parametrize("column", [0, 384])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_oai_nan_survives_clamp(column, dtype, monkeypatch):
+def test_oai_nan_survives_clamp(column, dtype):
     """A NaN gate or up value must not be replaced by the clamp bound."""
-    monkeypatch.setattr(moe, "_int8_quant_dispatch_policy", lambda: False)
     packed = torch.ones((2, 768), device="cuda", dtype=dtype)
     packed[0, column] = float("nan")
     activated = torch.empty((2, 384), device="cuda", dtype=dtype)

@@ -17,7 +17,6 @@ import logging
 import math
 import numbers
 import os
-import sys
 from enum import Enum
 from typing import Any, Optional
 
@@ -47,9 +46,10 @@ _HALF_GEMM_TILE_K = 64
 _HALF_GEMM2_TILE_N = 256
 _PLAIN_HALF_CONFIG_DTYPES = ("fp16", "bf16")
 
-# Experimental, opt-in W8A8 path.  "quant" changes only the two per-token
-# quantizers; "quant_oai" also fuses OAI activation with the second quantizer.
-# The normal FlagGems path remains the default in this isolated candidate.
+# Experimental, opt-in W8A8 path.  "quant_oai" fuses the OAI activation into
+# the second per-token quantizer, saving a round trip through the workspace.
+# The per-token quantizers themselves are always the Triton kernels and need
+# no opt-in; only this fusion is gated.
 _W8A8_QUANT_FUSION_MODE = os.environ.get("FLAG_GEMS_W8A8_QUANT_FUSION", "off").lower()
 
 
@@ -940,22 +940,11 @@ def _int8_quantize(
         return A_q, scale
 
     elif per_act_token:
-        if (
-            _W8A8_QUANT_FUSION_MODE in ("quant", "quant_oai")
-            and A.ndim == 2
-            and A.dtype in (torch.bfloat16, torch.float16)
-            and A.device.type in ("cuda", "musa", "xpu")
-            and 0 < A.size(-1) <= 8192
-            and _int8_quant_dispatch_policy() is not None
-        ):
-            return _int8_quantize_per_token_triton(A)
-        A_flat = A.reshape(-1, A.size(-1))
-        amax = A_flat.abs().amax(dim=-1, keepdim=True).clamp(min=eps).to(torch.float32)
-        scale = amax / int8_max
-        A_q = (A_flat.float() / scale).round().clamp(int8_min, int8_max).to(torch.int8)
-        A_q = A_q.reshape(A.shape)
-        scale = scale.reshape(A.shape[:-1] + (1,))
-        return A_q, scale
+        # One Triton kernel, no eager reduce/divide/round chain.  That chain
+        # dispatched through abs/amax/clamp/div/round, so its arithmetic
+        # depended on whether FlagGems had overridden those operators.
+        A_q, scale = _int8_quantize_per_token_triton(A.reshape(-1, A.size(-1)))
+        return A_q.reshape(A.shape), scale.reshape(A.shape[:-1] + (1,))
 
     else:
         assert A_scale is not None, "int8 per-tensor requires A_scale"
@@ -964,40 +953,19 @@ def _int8_quantize(
         return A_q, A_scale
 
 
-_INT8_QUANT_REQUIRED_FG_KEYS = frozenset(
-    ("abs", "amax", "clamp", "div.Scalar", "div.Tensor", "round")
-)
-
-
-def _registrar_has_complete_int8_quant(registrar) -> bool:
-    # A registrar's key list can change in place through register_impl/for_each.
-    # Never cache by registrar identity: stale membership changes NaN semantics.
-    return _INT8_QUANT_REQUIRED_FG_KEYS.issubset(set(registrar.get_all_keys()))
-
-
-def _int8_quant_dispatch_policy() -> bool | None:
-    """False=plain Torch, True=full FG chain, None=mixed/unknown fallback."""
-    package = sys.modules.get("flag_gems")
-    registrar = getattr(package, "current_work_registrar", None)
-    if registrar is None:
-        return False
-    if not hasattr(registrar, "get_all_keys"):
-        return None
-    return True if _registrar_has_complete_int8_quant(registrar) else None
+# Widest row the single-pass quantizer keeps resident in registers; wider
+# rows take the two-pass kernel instead.
+_INT8_QUANT_MAX_SINGLE_PASS_K = 8192
 
 
 @triton.jit
-def _round_to_int8_even(x, FG_DISPATCH: tl.constexpr):
+def _round_to_int8_even(x):
     """Portable round-to-nearest-even for the bounded INT8 quotient."""
-    # PyTorch's round() precedes clamp() and casts NaN to zero on the target
-    # integer path.  Clamp first is equivalent for finite inputs, including
-    # half-way cases at the endpoints, and makes Inf handling explicit.
-    if FG_DISPATCH:
-        # FlagGems round/clamp/cast turns NaN quotients into -128 on the
-        # pinned live backend; plain Torch turns them into zero.
-        x = tl.where(x == x, x, -128.0)
-    else:
-        x = tl.where(x == x, x, 0.0)
+    # Clamp before rounding so the endpoints and Inf are handled explicitly;
+    # for finite inputs this agrees with rounding first, half-way cases
+    # included.  A NaN quotient only arises from a NaN input row, where the
+    # scale is NaN too, so the quantized value is reported as zero.
+    x = tl.where(x == x, x, 0.0)
     x = tl.minimum(tl.maximum(x, -128.0), 127.0)
     floor_x = tl.floor(x)
     fraction = x - floor_x
@@ -1007,33 +975,22 @@ def _round_to_int8_even(x, FG_DISPATCH: tl.constexpr):
 
 
 @triton.jit
-def _per_token_int8_values(
-    x, valid, storage_dtype: tl.constexpr, FG_DISPATCH: tl.constexpr
-):
-    """Match _int8_quantize's source-dtype amax/clamp and FP32 scale/divide."""
+def _per_token_int8_values(x, valid, storage_dtype: tl.constexpr):
+    """Per-row dynamic INT8 scale and quantized values, computed in FP32."""
     x = x.to(tl.float32)
     amax = tl.max(tl.where(valid, tl.abs(x), 0.0), axis=0)
-    # tl.max ignores NaN while torch.amax propagates it.  The second reduction
-    # is zero for finite input and NaN if any valid lane contains NaN.
-    if not FG_DISPATCH:
-        nan_term = tl.sum(tl.where(valid & (x != x), x, 0.0), axis=0)
+    # tl.max ignores NaN, so recover propagation explicitly: this term is zero
+    # for finite rows and NaN when any valid lane holds NaN.
+    nan_term = tl.sum(tl.where(valid & (x != x), x, 0.0), axis=0)
     # Form the literal in FP32 first. Triton's low-precision tl.full can
     # underflow this BF16 clamp constant on the target compiler.
     eps = tl.full((), 1e-10, tl.float32).to(storage_dtype).to(tl.float32)
     amax = tl.maximum(amax, eps)
-    if not FG_DISPATCH:
-        amax += nan_term
-    # PyTorch's Tensor / Python-int scalar path lowers to FP32 reciprocal
-    # multiplication on this runtime; rounded division differs by one ULP
-    # for values such as amax=52 and can flip INT8 half-way decisions.
+    amax += nan_term
     scale = amax * tl.full((), 1.0 / 127.0, tl.float32)
-    # FlagGems true_divide uses Triton's default approximate f32 division;
-    # its half-way decisions can differ from PyTorch's rounded division.
-    if FG_DISPATCH:
-        quotient = x / scale
-    else:
-        quotient = tl.div_rn(x, scale)
-    return _round_to_int8_even(quotient, FG_DISPATCH), scale
+    # Round-to-nearest division rather than Triton's default approximate
+    # reciprocal, which can land on the wrong side of an INT8 half-way point.
+    return _round_to_int8_even(tl.div_rn(x, scale)), scale
 
 
 @triton.jit
@@ -1044,42 +1001,96 @@ def _int8_quantize_per_token_kernel(
     K: tl.constexpr,
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
-    FG_DISPATCH: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_K).to(tl.int64)
     valid = cols < K
     x = tl.load(input_ptr + row * stride_im + cols * stride_ik, valid, other=0)
-    q, scale = _per_token_int8_values(x, valid, input_ptr.dtype.element_ty, FG_DISPATCH)
+    q, scale = _per_token_int8_values(x, valid, input_ptr.dtype.element_ty)
     tl.store(output_ptr + row * K + cols, q, valid)
     tl.store(scale_ptr + row, scale)
+
+
+@triton.jit
+def _int8_quantize_per_token_wide_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    K,
+    stride_im,
+    stride_ik,
+    BLOCK_K: tl.constexpr,
+):
+    """Two-pass variant for rows too wide to hold in one block.
+
+    Reduces over K, then re-reads the row to divide.  Same arithmetic as the
+    single-pass kernel; it just cannot keep the row resident between passes.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    base = input_ptr + row * stride_im
+    storage_dtype: tl.constexpr = input_ptr.dtype.element_ty
+
+    amax = tl.zeros((), tl.float32)
+    nan_term = tl.zeros((), tl.float32)
+    for start in tl.range(0, K, BLOCK_K):
+        cols = start + tl.arange(0, BLOCK_K).to(tl.int64)
+        valid = cols < K
+        x = tl.load(base + cols * stride_ik, valid, other=0).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.where(valid, tl.abs(x), 0.0), axis=0))
+        nan_term += tl.sum(tl.where(valid & (x != x), x, 0.0), axis=0)
+
+    eps = tl.full((), 1e-10, tl.float32).to(storage_dtype).to(tl.float32)
+    amax = tl.maximum(amax, eps) + nan_term
+    scale = amax * tl.full((), 1.0 / 127.0, tl.float32)
+    tl.store(scale_ptr + row, scale)
+
+    for start in tl.range(0, K, BLOCK_K):
+        cols = start + tl.arange(0, BLOCK_K).to(tl.int64)
+        valid = cols < K
+        x = tl.load(base + cols * stride_ik, valid, other=0).to(tl.float32)
+        q = _round_to_int8_even(tl.div_rn(x, scale))
+        tl.store(output_ptr + row * K + cols, q, valid)
 
 
 def _int8_quantize_per_token_triton(
     A: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stride-aware 2D dynamic INT8 quantizer; one program per input row."""
-    assert A.ndim == 2 and A.dtype in (torch.bfloat16, torch.float16)
+    assert A.ndim == 2, f"per-token INT8 quant expects a 2D input, got {A.ndim}D"
+    assert A.dtype in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ), f"unsupported per-token INT8 quant input dtype {A.dtype}"
     M, K = A.shape
-    assert 0 < K <= 8192
-    fg_dispatch = _int8_quant_dispatch_policy()
-    if fg_dispatch is None:
-        raise RuntimeError("Mixed FlagGems quant registration requires original path")
+    assert K > 0, f"per-token INT8 quant needs a non-empty row, got K={K}"
     A_q = torch.empty((M, K), device=A.device, dtype=torch.int8)
     scale = torch.empty((M, 1), device=A.device, dtype=torch.float32)
     if M:
-        _int8_quantize_per_token_kernel[(M,)](
-            A,
-            A_q,
-            scale,
-            K,
-            A.stride(0),
-            A.stride(1),
-            FG_DISPATCH=fg_dispatch,
-            BLOCK_K=triton.next_power_of_2(K),
-            num_warps=4 if K <= 2048 else 8,
-        )
+        if K <= _INT8_QUANT_MAX_SINGLE_PASS_K:
+            _int8_quantize_per_token_kernel[(M,)](
+                A,
+                A_q,
+                scale,
+                K,
+                A.stride(0),
+                A.stride(1),
+                BLOCK_K=triton.next_power_of_2(K),
+                num_warps=4 if K <= 2048 else 8,
+            )
+        else:
+            # Wider than one block: reduce and divide in two passes.
+            _int8_quantize_per_token_wide_kernel[(M,)](
+                A,
+                A_q,
+                scale,
+                K,
+                A.stride(0),
+                A.stride(1),
+                BLOCK_K=_INT8_QUANT_MAX_SINGLE_PASS_K,
+                num_warps=8,
+            )
     return A_q, scale
 
 
@@ -1099,7 +1110,6 @@ def _swigluoai_quantize_per_token_kernel(
     alpha,
     beta,
     clamp_limit,
-    FG_DISPATCH: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -1121,9 +1131,7 @@ def _swigluoai_quantize_per_token_kernel(
     # Retain the observable BF16/FP16 workspace rounding before quant2.
     activated = activated.to(activation_ptr.dtype.element_ty)
     tl.store(activation_ptr + row * stride_om + cols * stride_ok, activated, valid)
-    q, scale = _per_token_int8_values(
-        activated, valid, activation_ptr.dtype.element_ty, FG_DISPATCH
-    )
+    q, scale = _per_token_int8_values(activated, valid, activation_ptr.dtype.element_ty)
     tl.store(quant_ptr + row * K + cols, q, valid)
     tl.store(scale_ptr + row, scale)
 
@@ -1148,9 +1156,6 @@ def _swigluoai_quantize_per_token_triton(
     assert input.dtype in (torch.bfloat16, torch.float16)
     M, K = activation_output.shape
     assert 0 < K <= 8192
-    fg_dispatch = _int8_quant_dispatch_policy()
-    if fg_dispatch is None:
-        raise RuntimeError("Mixed FlagGems quant registration requires original path")
     q = torch.empty((M, K), device=input.device, dtype=torch.int8)
     scale = torch.empty((M, 1), device=input.device, dtype=torch.float32)
     if M:
@@ -1167,7 +1172,6 @@ def _swigluoai_quantize_per_token_triton(
             alpha,
             beta,
             clamp_limit,
-            FG_DISPATCH=fg_dispatch,
             BLOCK_K=triton.next_power_of_2(K),
             num_warps=4 if K <= 2048 else 8,
         )
@@ -2615,7 +2619,6 @@ def fused_experts_impl(
             and intermediate_cache2.dtype in (torch.bfloat16, torch.float16)
             and intermediate_cache2.device.type in ("cuda", "musa", "xpu")
             and 0 < activation_out_dim <= 8192
-            and _int8_quant_dispatch_policy() is not None
         )
         if fused_oai_quant2:
             qintermediate_cache2, a2q_scale = _swigluoai_quantize_per_token_triton(
